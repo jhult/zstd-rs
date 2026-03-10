@@ -3,8 +3,155 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs};
 
+/// Search for an executable in PATH.
+#[cfg(feature = "cmake")]
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths).find_map(|dir| {
+            let full_path = dir.join(name);
+            if full_path.is_file() {
+                Some(full_path)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Map a Rust target triple to a zig target triple.
+#[cfg(feature = "cmake")]
+fn rust_target_to_zig_target(rust_target: &str) -> Option<String> {
+    let arch = rust_target.split('-').next()?;
+
+    if rust_target.contains("apple-darwin") {
+        Some(format!("{}-macos-none", arch))
+    } else if rust_target.contains("windows-gnu") {
+        Some(format!("{}-windows-gnu", arch))
+    } else if rust_target.contains("linux-musl") {
+        Some(format!("{}-linux-musl", arch))
+    } else if rust_target.contains("linux-gnu") {
+        Some(format!("{}-linux-gnu", arch))
+    } else {
+        None
+    }
+}
+
+/// When cross-compiling with the cmake feature and no explicit CC is set,
+/// auto-detect zig and use it as the C/C++ cross-compiler.
+/// This enables `cargo zigbuild` to work out of the box.
+#[cfg(feature = "cmake")]
+fn setup_zig_cross_compiler() {
+    let target = env::var("TARGET").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+
+    if target == host {
+        return;
+    }
+
+    // Respect explicit compiler settings
+    let cc_target_env = format!("CC_{}", target.replace('-', "_"));
+    if env::var_os(&cc_target_env).is_some()
+        || env::var_os("TARGET_CC").is_some()
+        || env::var_os("CC").is_some()
+    {
+        return;
+    }
+
+    let zig_path = match find_in_path("zig") {
+        Some(p) => p,
+        None => return,
+    };
+
+    let zig_target = match rust_target_to_zig_target(&target) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Generate wrapper scripts in OUT_DIR so cmake can invoke zig
+    // as a single-path compiler command.
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+
+    // The wrapper scripts filter out --target= flags that cmake-rs may add
+    // (e.g. --target=x86_64-apple-macosx) since these conflict with zig's
+    // own target specification.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Use bash for array support (safe argument handling with spaces)
+        let wrapper_template = |cmd: &str| {
+            format!(
+                concat!(
+                    "#!/bin/bash\n",
+                    "args=()\n",
+                    "for arg in \"$@\"; do\n",
+                    "    case \"$arg\" in\n",
+                    "        --target=*) ;;\n",
+                    "        *) args+=(\"$arg\") ;;\n",
+                    "    esac\n",
+                    "done\n",
+                    "exec \"{}\" {} -target {} \"${{args[@]}}\"\n",
+                ),
+                zig_path.display(),
+                cmd,
+                zig_target
+            )
+        };
+
+        let cc_wrapper = out_dir.join("zig-cc");
+        fs::write(&cc_wrapper, wrapper_template("cc")).unwrap();
+        fs::set_permissions(&cc_wrapper, fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let cxx_wrapper = out_dir.join("zig-cxx");
+        fs::write(&cxx_wrapper, wrapper_template("c++")).unwrap();
+        fs::set_permissions(&cxx_wrapper, fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        // Set target-specific env vars so cmake-rs (via cc crate) picks them up
+        env::set_var(
+            format!("CC_{}", target.replace('-', "_")),
+            &cc_wrapper,
+        );
+        env::set_var(
+            format!("CXX_{}", target.replace('-', "_")),
+            &cxx_wrapper,
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows, filter --target= via a PowerShell one-liner in a .bat wrapper
+        let wrapper_template = |cmd: &str| {
+            format!(
+                "@echo off\r\nsetlocal enabledelayedexpansion\r\nset \"ARGS=\"\r\nfor %%a in (%*) do (\r\n    echo %%a | findstr /b /c:\"--target=\" >nul || set \"ARGS=!ARGS! %%a\"\r\n)\r\n\"{}\" {} -target {} !ARGS!\r\n",
+                zig_path.display(),
+                cmd,
+                zig_target
+            )
+        };
+
+        let cc_wrapper = out_dir.join("zig-cc.bat");
+        fs::write(&cc_wrapper, wrapper_template("cc")).unwrap();
+
+        let cxx_wrapper = out_dir.join("zig-cxx.bat");
+        fs::write(&cxx_wrapper, wrapper_template("c++")).unwrap();
+
+        env::set_var(
+            format!("CC_{}", target.replace('-', "_")),
+            &cc_wrapper,
+        );
+        env::set_var(
+            format!("CXX_{}", target.replace('-', "_")),
+            &cxx_wrapper,
+        );
+    }
+}
+
 #[cfg(feature = "cmake")]
 fn compile_zstd_cmake() {
+    setup_zig_cross_compiler();
+
     let mut config = cmake::Config::new("zstd/build/cmake");
 
     // Build only the static library
