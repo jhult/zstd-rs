@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  zigbuild:
+    strategy:
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-gnu
+          - wasm32-unknown-unknown
+
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rust-cross/cargo-zigbuild:sha-59b27c3
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Install CMake
+      if: matrix.target != 'wasm32-unknown-unknown'
+      run: |
+        apt-get update -y && apt-get install -y --no-install-recommends --no-install-suggests cmake
+
+    - name: Add wasm target
+      if: matrix.target == 'wasm32-unknown-unknown'
+      run: rustup target add wasm32-unknown-unknown
+
+    - name: Install clippy
+      run: rustup component add clippy
+
+    - name: Run cargo clippy
+      if: matrix.target != 'wasm32-unknown-unknown'
+      run: cargo clippy --target ${{ matrix.target }} --features cmake -- -D warnings
+
+    - name: Build
+      run: cargo zigbuild --target ${{ matrix.target }}
+
+    - name: Build with thin feature
+      run: cargo zigbuild --target ${{ matrix.target }} --features thin
+
+    - name: Build with cmake feature
+      if: matrix.target != 'wasm32-unknown-unknown'
+      run: cargo zigbuild --target ${{ matrix.target }} --features cmake
+
+    - name: Build with cmake feature (no default features)
+      if: matrix.target != 'wasm32-unknown-unknown'
+      run: cargo zigbuild --target ${{ matrix.target }} --no-default-features --features cmake,legacy,zdict_builder
+
+  windows-msvc:
+    strategy:
+      matrix:
+        target:
+          - i686-pc-windows-msvc
+          - x86_64-pc-windows-msvc
+
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable-${{ matrix.target }}
+        targets: ${{ matrix.target }}
+
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Build with feature thin
+      run: cargo build --verbose --features thin
+    - name: Run tests with feature thin
+      run: cargo test --verbose --features thin
+
+    - name: Build zstd-safe with feature seekable
+      run: cargo build --manifest-path zstd-safe/Cargo.toml --verbose --features seekable
+    - name: Run zstd-safe tests with feature seekable
+      run: cargo test --manifest-path zstd-safe/Cargo.toml --verbose --features seekable
+    - name: Build zstd-safe with features std and seekable
+      run: cargo build --manifest-path zstd-safe/Cargo.toml --verbose --features std,seekable
+    - name: Run zstd-safe tests with features std and seekable
+      run: cargo test --manifest-path zstd-safe/Cargo.toml --verbose --features std,seekable
